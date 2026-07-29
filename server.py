@@ -1,6 +1,6 @@
 """
-JV-60FPS Server (FFmpeg-based Patcher)
-Processes videos using FFmpeg filters and faststart remuxing.
+JV-60FPS Server
+Executes FFmpeg encoding followed by node patcher.js
 """
 
 import os
@@ -21,7 +21,7 @@ def cors(r):
 
 @app.route('/')
 def index():
-    return jsonify({"status": "ok", "service": "JV FFmpeg 60FPS Server"})
+    return jsonify({"status": "ok", "service": "JV 60FPS Server (Node Patcher)"})
 
 @app.route('/health')
 def health():
@@ -43,21 +43,23 @@ def patch():
     if len(raw) > MAX_SIZE:
         return jsonify({"error": "File too large (max 500MB)"}), 413
 
-    # Define temporary file paths
     in_tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+    encoded_tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
     out_tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+
     in_path = in_tmp.name
+    encoded_path = encoded_tmp.name
     out_path = out_tmp.name
 
     try:
-        # Write input data to disk
         in_tmp.write(raw)
         in_tmp.flush()
         in_tmp.close()
+        encoded_tmp.close()
         out_tmp.close()
 
-        # Build FFmpeg command
-        cmd = [
+        # Step 1: Run FFmpeg Encoding
+        ffmpeg_cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
             "-i", in_path,
             "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
@@ -67,22 +69,27 @@ def patch():
             "-g", "120", "-keyint_min", "120", "-sc_threshold", "0",
             "-c:a", "aac", "-b:a", "256k", "-ar", "48000",
             "-movflags", "+faststart",
-            out_path
+            encoded_path
         ]
 
-        # Execute FFmpeg command
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        ffmpeg_res = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if ffmpeg_res.returncode != 0:
+            raise RuntimeError(f"FFmpeg encoding failed: {ffmpeg_res.stderr.strip()}")
 
-        if result.returncode != 0:
-            raise RuntimeError(f"FFmpeg encoding failed: {result.stderr.strip()}")
+        # Step 2: Run patcher.js using Node
+        script_path = os.path.join(os.path.dirname(__file__), "patcher.js")
+        node_cmd = ["node", script_path, encoded_path, out_path]
+
+        node_res = subprocess.run(node_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if node_res.returncode != 0:
+            raise RuntimeError(f"Node patcher failed: {node_res.stderr.strip()}")
 
         file_id = uuid.uuid4().hex
         out_name = f'jv_{file_id}.mp4'
 
-        # Safely remove temp files after request completes
         @after_this_request
         def cleanup(response):
-            for path in (in_path, out_path):
+            for path in (in_path, encoded_path, out_path):
                 try:
                     if os.path.exists(path):
                         os.remove(path)
@@ -95,8 +102,7 @@ def patch():
         return resp
 
     except Exception as e:
-        # Cleanup files immediately if an error occurs
-        for path in (in_path, out_path):
+        for path in (in_path, encoded_path, out_path):
             if os.path.exists(path):
                 try:
                     os.remove(path)
