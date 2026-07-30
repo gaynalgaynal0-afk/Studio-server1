@@ -1,6 +1,6 @@
 """
-JV MP4 Server
-Handles post requests by delegating to patcher.js
+JV Render Server (WASM Patcher Host)
+Handles POST requests by invoking patcher.js with FFmpeg WASM
 """
 
 import os
@@ -21,7 +21,7 @@ def cors(r):
 
 @app.route('/')
 def index():
-    return jsonify({"status": "ok", "service": "JV MP4 Patcher Server"})
+    return jsonify({"status": "ok", "service": "JV WASM Server Ready"})
 
 @app.route('/health')
 def health():
@@ -35,13 +35,13 @@ def patch_options():
 def patch():
     f = request.files.get('video') or request.files.get('file')
     if not f:
-        return jsonify({"error": "No video file provided"}), 400
+        return jsonify({"error": "No video file provided in form-data"}), 400
 
     raw = f.read()
     if not raw:
-        return jsonify({"error": "Empty file"}), 400
+        return jsonify({"error": "File is empty"}), 400
     if len(raw) > MAX_SIZE:
-        return jsonify({"error": "File exceeds max limit of 500MB"}), 413
+        return jsonify({"error": "File exceeds maximum size limit (500MB)"}), 413
 
     in_tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
     out_tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
@@ -50,23 +50,33 @@ def patch():
     out_path = out_tmp.name
 
     try:
-        # Save raw uploaded bytes to a temporary file
+        # 1. Write uploaded bytes to input temp file
         in_tmp.write(raw)
         in_tmp.flush()
         in_tmp.close()
         out_tmp.close()
 
-        # Execute Node.js script
+        # 2. Call Node.js script (patcher.js)
         script_path = os.path.join(os.path.dirname(__file__), "patcher.js")
         node_cmd = ["node", script_path, in_path, out_path]
 
-        node_res = subprocess.run(node_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # Running subprocess with extended timeout for WASM initialization
+        node_res = subprocess.run(
+            node_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=300  # 5 minutes max timeout
+        )
+
         if node_res.returncode != 0:
-            raise RuntimeError(f"Node patcher error: {node_res.stderr.strip()}")
+            error_msg = node_res.stderr.strip() or node_res.stdout.strip()
+            raise RuntimeError(f"Node execution failed: {error_msg}")
 
         file_id = uuid.uuid4().hex
         out_name = f'jv_{file_id}.mp4'
 
+        # Cleanup temp files after response is sent
         @after_this_request
         def cleanup(response):
             for path in (in_path, out_path):
@@ -81,14 +91,20 @@ def patch():
         resp.headers['X-File-Id'] = file_id
         return resp
 
+    except subprocess.TimeoutExpired:
+        cleanup_temp_files(in_path, out_path)
+        return jsonify({"error": "Processing timed out (WASM execution took too long)"}), 504
     except Exception as e:
-        for path in (in_path, out_path):
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
+        cleanup_temp_files(in_path, out_path)
         return jsonify({"error": str(e)}), 422
+
+def cleanup_temp_files(*paths):
+    for path in paths:
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
