@@ -1,291 +1,303 @@
-const fs = require("fs");
-const path = require("path");
+import sys
+import os
+import tempfile
+import subprocess
 
-const CONTAINERS = new Set(["moov", "trak", "mdia", "minf", "stbl", "edts", "dinf", "udta", "meta", "ilst"]);
-const FAKE_SAMPLE = Buffer.from([0, 0, 0, 4, 0, 0, 0, 0]);
+# --- MP4 Parsing & Patching Constants ---
+CONTAINERS = {"moov", "trak", "mdia", "minf", "stbl", "edts", "dinf", "udta", "meta", "ilst"}
+FAKE_SAMPLE = b'\x00\x00\x00\x04\x00\x00\x00\x00'
 
-function u32(buf, pos) { return buf.readUInt32BE(pos); }
-function u64(buf, pos) { return Number(buf.readBigUInt64BE(pos)); }
-function w32(val) { const b = Buffer.alloc(4); b.writeUInt32BE(val >>> 0, 0); return b; }
-function box(type, payload) { return Buffer.concat([w32(payload.length + 8), Buffer.from(type, "latin1"), payload]); }
-function boxType(buf, pos) { return buf.toString("latin1", pos + 4, pos + 8); }
+def u32(b, pos): 
+    return int.from_bytes(b[pos:pos+4], 'big')
 
-function sizeAt(buf, pos, max) {
-  if (pos + 8 > max) return 0;
-  const s = u32(buf, pos);
-  if (s === 1) {
-    if (pos + 16 > max) return 0;
-    return u64(buf, pos + 8);
-  }
-  if (s === 0) return max - pos;
-  return s;
-}
+def u64(b, pos): 
+    return int.from_bytes(b[pos:pos+8], 'big')
 
-function parseBoxes(buf, start, end) {
-  const boxes = [];
-  let curr = start;
-  while (curr + 8 <= end) {
-    const s = sizeAt(buf, curr, end);
-    if (!s || curr + s > end) break;
-    const type = boxType(buf, curr);
-    const hdr = u32(buf, curr) === 1 ? 16 : 8;
-    const b = { type, start: curr, end: curr + s, size: s, header: hdr, children: null };
-    let childStart = curr + hdr;
-    if (type === "meta") childStart += 4;
-    if (CONTAINERS.has(type) && childStart < curr + s) b.children = parseBoxes(buf, childStart, curr + s);
-    boxes.push(b);
-    curr += s;
-  }
-  return boxes;
-}
+def w32(val): 
+    return (val & 0xffffffff).to_bytes(4, 'big')
 
-function raw(buf, boxObj) { return buf.subarray(boxObj.start, boxObj.end); }
-function payload(buf, boxObj) { return buf.subarray(boxObj.start + boxObj.header, boxObj.end); }
-function findChild(parent, type) { return (parent.children || []).find(c => c.type === type); }
-function childPath(parent, pathArr) {
-  let curr = parent;
-  for (const t of pathArr) {
-    curr = findChild(curr, t);
-    if (!curr) return null;
-  }
-  return curr;
-}
+def box(b_type, payload): 
+    return w32(len(payload) + 8) + b_type.encode('latin1') + payload
 
-// --- Step 1: Pure JS Remux (Faststart Offset Adjustment) ---
-function updateChunkOffsets(buf, b, shift) {
-  const p = payload(buf, b);
-  const hdr = p.subarray(0, 4);
-  const count = u32(p, 4);
+def box_type(b, pos): 
+    return b[pos+4:pos+8].decode('latin1', errors='ignore')
 
-  if (b.type === "stco") {
-    const out = Buffer.alloc(8 + count * 4);
-    hdr.copy(out, 0);
-    out.writeUInt32BE(count, 4);
-    for (let i = 0, off = 8; i < count; i++, off += 4) {
-      out.writeUInt32BE((u32(p, off) + shift) >>> 0, 8 + i * 4);
-    }
-    return box("stco", out);
-  } else if (b.type === "co64") {
-    const out = Buffer.alloc(8 + count * 8);
-    hdr.copy(out, 0);
-    out.writeUInt32BE(count, 4);
-    for (let i = 0, off = 8; i < count; i++, off += 8) {
-      out.writeBigUInt64BE(BigInt(u64(p, off) + shift), 8 + i * 8);
-    }
-    return box("co64", out);
-  }
-  return raw(buf, b);
-}
+def size_at(b, pos, max_len):
+    if pos + 8 > max_len: 
+        return 0
+    s = u32(b, pos)
+    if s == 1:
+        if pos + 16 > max_len: 
+            return 0
+        return u64(b, pos + 8)
+    if s == 0: 
+        return max_len - pos
+    return s
 
-function remuxFaststart(inputBuf) {
-  const boxes = parseBoxes(inputBuf, 0, inputBuf.length);
-  const ftyp = boxes.find(b => b.type === "ftyp");
-  const moov = boxes.find(b => b.type === "moov");
-  const mdat = boxes.find(b => b.type === "mdat");
+def parse_boxes(b, start, end):
+    boxes = []
+    curr = start
+    while curr + 8 <= end:
+        s = size_at(b, curr, end)
+        if not s or curr + s > end: 
+            break
+        t = box_type(b, curr)
+        hdr = 16 if u32(b, curr) == 1 else 8
+        obj = {'type': t, 'start': curr, 'end': curr + s, 'size': s, 'header': hdr, 'children': None}
+        child_start = curr + hdr
+        if t == 'meta': 
+            child_start += 4
+        if t in CONTAINERS and child_start < curr + s:
+            obj['children'] = parse_boxes(b, child_start, curr + s)
+        boxes.append(obj)
+        curr += s
+    return boxes
 
-  if (!moov || !mdat) return inputBuf;
+def raw(b, box_obj): 
+    return b[box_obj['start']:box_obj['end']]
 
-  function shiftMoovOffsets(b, shift) {
-    if (b.type === "udta") return null;
-    if (b.type === "stco" || b.type === "co64") return updateChunkOffsets(inputBuf, b, shift);
-    if (b.children) {
-      const parts = [];
-      if (b.type === "meta") parts.push(payload(inputBuf, b).subarray(0, 4));
-      for (const child of b.children) {
-        const patched = shiftMoovOffsets(child, shift);
-        if (patched) parts.push(patched);
-      }
-      return box(b.type, Buffer.concat(parts));
-    }
-    return raw(inputBuf, b);
-  }
+def payload(b, box_obj): 
+    return b[box_obj['start'] + box_obj['header']:box_obj['end']]
 
-  let shiftedMoov = shiftMoovOffsets(moov, 0);
-  if (moov.start > mdat.start) {
-    shiftedMoov = shiftMoovOffsets(moov, shiftedMoov.length);
-  }
+def find_child(parent, t): 
+    return next((c for c in (parent.get('children') or []) if c['type'] == t), None)
 
-  const outBoxes = [];
-  if (ftyp) outBoxes.push(raw(inputBuf, ftyp));
-  outBoxes.push(shiftedMoov);
-  outBoxes.push(raw(inputBuf, mdat));
+def child_path(parent, path_list):
+    curr = parent
+    for t in path_list:
+        curr = find_child(curr, t)
+        if not curr: 
+            return None
+    return curr
 
-  return Buffer.concat(outBoxes);
-}
+def is_video_trak(b, trak):
+    hdlr = child_path(trak, ["mdia", "hdlr"])
+    if not hdlr: 
+        return False
+    return payload(b, hdlr)[8:12].decode('latin1', errors='ignore') == "vide"
 
-// --- Step 2: Patch Sample Tables & Metadata ---
-function isVideoTrak(buf, trak) {
-  const hdlr = childPath(trak, ["mdia", "hdlr"]);
-  return Boolean(hdlr && payload(buf, hdlr).toString("latin1", 8, 12) === "vide");
-}
+def patch_mdhd_lang(b, box_obj):
+    p = bytearray(payload(b, box_obj))
+    off = 28 if p[0] == 1 else 16
+    if off + 2 <= len(p):
+        p[off:off+2] = (21956).to_bytes(2, 'big')
+    return box("mdhd", bytes(p))
 
-function patchMdhdLang(buf, b) {
-  const p = Buffer.from(payload(buf, b));
-  const off = p[0] === 1 ? 28 : 16;
-  if (off + 2 <= p.length) p.writeUInt16BE(21956, off);
-  return box("mdhd", p);
-}
+def patch_hdlr_name(b, box_obj):
+    p = payload(b, box_obj)
+    name = p[8:12].decode('latin1', errors='ignore') if len(p) >= 12 else ""
+    h_name = "VideoHandler\0" if name == "vide" else ("SoundHandler\0" if name == "soun" else None)
+    if not h_name:
+        return raw(b, box_obj)
+    return box("hdlr", p[:24] + h_name.encode('utf8'))
 
-function patchHdlrName(buf, b) {
-  const p = Buffer.from(payload(buf, b));
-  const name = p.length >= 12 ? p.toString("latin1", 8, 12) : "";
-  const hName = name === "vide" ? "VideoHandler\0" : name === "soun" ? "SoundHandler\0" : null;
-  if (!hName) return raw(buf, b);
-  return box("hdlr", Buffer.concat([p.subarray(0, 24), Buffer.from(hName, "utf8")]));
-}
+def patch_stsz(b, box_obj, add_count):
+    if add_count < 1: 
+        return raw(b, box_obj)
+    p = payload(b, box_obj)
+    hdr = p[:4]
+    s_size = u32(p, 4)
+    count = u32(p, 8)
+    sizes = []
+    if s_size != 0:
+        sizes = [s_size] * count
+    else:
+        off = 12
+        for _ in range(count):
+            if off + 4 <= len(p):
+                sizes.append(u32(p, off))
+                off += 4
+    sizes.extend([8] * add_count)
+    out = bytearray(12 + len(sizes) * 4)
+    out[:4] = hdr
+    out[4:8] = w32(0)
+    out[8:12] = w32(len(sizes))
+    for idx, sz in enumerate(sizes):
+        out[12 + idx * 4:16 + idx * 4] = w32(sz)
+    return box("stsz", bytes(out))
 
-function patchStsz(buf, b, addCount) {
-  if (addCount < 1) return raw(buf, b);
-  const p = payload(buf, b);
-  const hdr = p.subarray(0, 4);
-  const sSize = u32(p, 4);
-  const count = u32(p, 8);
-  const sizes = [];
-  if (sSize !== 0) {
-    for (let i = 0; i < count; i++) sizes.push(sSize);
-  } else {
-    for (let i = 0, off = 12; i < count && off + 4 <= p.length; i++, off += 4) sizes.push(u32(p, off));
-  }
-  for (let i = 0; i < addCount; i++) sizes.push(8);
-  const out = Buffer.alloc(12 + sizes.length * 4);
-  hdr.copy(out, 0);
-  out.writeUInt32BE(0, 4);
-  out.writeUInt32BE(sizes.length, 8);
-  sizes.forEach((sz, idx) => out.writeUInt32BE(sz >>> 0, 12 + idx * 4));
-  return box("stsz", out);
-}
+def patch_stsc(b, box_obj, last_chunk):
+    if last_chunk < 1: 
+        return raw(b, box_obj)
+    p = payload(b, box_obj)
+    hdr = p[:4]
+    count = u32(p, 4)
+    entries = []
+    off = 8
+    for _ in range(count):
+        if off + 12 <= len(p):
+            entries.append((u32(p, off), u32(p, off + 4), u32(p, off + 8)))
+            off += 12
+    last_desc = entries[-1][2] if entries else 1
+    entries.append((last_chunk + 1, 1, last_desc))
+    out = bytearray(8 + len(entries) * 12)
+    out[:4] = hdr
+    out[4:8] = w32(len(entries))
+    for idx, e in enumerate(entries):
+        base = 8 + idx * 12
+        out[base:base+4] = w32(e[0])
+        out[base+4:base+8] = w32(e[1])
+        out[base+8:base+12] = w32(e[2])
+    return box("stsc", bytes(out))
 
-function patchStsc(buf, b, lastChunk) {
-  if (lastChunk < 1) return raw(buf, b);
-  const p = payload(buf, b);
-  const hdr = p.subarray(0, 4);
-  const count = u32(p, 4);
-  const entries = [];
-  for (let i = 0, off = 8; i < count && off + 12 <= p.length; i++, off += 12) {
-    entries.push([u32(p, off), u32(p, off + 4), u32(p, off + 8)]);
-  }
-  const lastDesc = entries.length ? entries[entries.length - 1][2] : 1;
-  entries.push([lastChunk + 1, 1, lastDesc]);
-  const out = Buffer.alloc(8 + entries.length * 12);
-  hdr.copy(out, 0);
-  out.writeUInt32BE(entries.length, 4);
-  entries.forEach((e, idx) => {
-    out.writeUInt32BE(e[0] >>> 0, 8 + idx * 12);
-    out.writeUInt32BE(e[1] >>> 0, 12 + idx * 12);
-    out.writeUInt32BE(e[2] >>> 0, 16 + idx * 12);
-  });
-  return box("stsc", out);
-}
+def patch_stco(b, box_obj, shift, fake_offset, add_count):
+    p = payload(b, box_obj)
+    hdr = p[:4]
+    count = u32(p, 4)
+    offsets = []
+    off = 8
+    for _ in range(count):
+        if off + 4 <= len(p):
+            offsets.append(u32(p, off) + shift)
+            off += 4
+    offsets.extend([fake_offset] * add_count)
+    out = bytearray(8 + len(offsets) * 4)
+    out[:4] = hdr
+    out[4:8] = w32(len(offsets))
+    for idx, o in enumerate(offsets):
+        out[8 + idx * 4:12 + idx * 4] = w32(o)
+    return box("stco", bytes(out))
 
-function patchStco(buf, b, shift, fakeOffset, addCount) {
-  const p = payload(buf, b);
-  const hdr = p.subarray(0, 4);
-  const count = u32(p, 4);
-  const offsets = [];
-  for (let i = 0, off = 8; i < count && off + 4 <= p.length; i++, off += 4) offsets.push(u32(p, off) + shift);
-  for (let i = 0; i < addCount; i++) offsets.push(fakeOffset);
-  const out = Buffer.alloc(8 + offsets.length * 4);
-  hdr.copy(out, 0);
-  out.writeUInt32BE(offsets.length, 4);
-  offsets.forEach((o, idx) => out.writeUInt32BE(o >>> 0, 8 + idx * 4));
-  return box("stco", out);
-}
+def patch_co64(b, box_obj, shift, fake_offset, add_count):
+    p = payload(b, box_obj)
+    hdr = p[:4]
+    count = u32(p, 4)
+    offsets = []
+    off = 8
+    for _ in range(count):
+        if off + 8 <= len(p):
+            offsets.append(u64(p, off) + shift)
+            off += 8
+    offsets.extend([fake_offset] * add_count)
+    out = bytearray(8 + len(offsets) * 8)
+    out[:4] = hdr
+    out[4:8] = w32(len(offsets))
+    for idx, o in enumerate(offsets):
+        out[8 + idx * 8:16 + idx * 8] = o.to_bytes(8, 'big')
+    return box("co64", bytes(out))
 
-function patchCo64(buf, b, shift, fakeOffset, addCount) {
-  const p = payload(buf, b);
-  const hdr = p.subarray(0, 4);
-  const count = u32(p, 4);
-  const offsets = [];
-  for (let i = 0, off = 8; i < count && off + 8 <= p.length; i++, off += 8) offsets.push(BigInt(u64(p, off) + shift));
-  for (let i = 0; i < addCount; i++) offsets.push(BigInt(fakeOffset));
-  const out = Buffer.alloc(8 + offsets.length * 8);
-  hdr.copy(out, 0);
-  out.writeUInt32BE(offsets.length, 4);
-  offsets.forEach((o, idx) => out.writeBigUInt64BE(o, 8 + idx * 8));
-  return box("co64", out);
-}
+# --- Main Patch Process ---
+def process_video(input_path, output_path):
+    remux_tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+    remux_path = remux_tmp.name
+    remux_tmp.close()
 
-async function runPatcher(inputPath, outputPath) {
-  // Read and perform in-memory faststart remux without FFmpeg
-  const rawInput = fs.readFileSync(inputPath);
-  const buf = remuxFaststart(rawInput);
+    try:
+        # Step 1: Native FFmpeg Faststart Remux
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', input_path,
+            '-map', '0',
+            '-c', 'copy',
+            '-map_metadata', '-1',
+            '-map_chapters', '-1',
+            '-brand', 'isom',
+            '-movflags', '+faststart',
+            '-video_track_timescale', '90000',
+            remux_path
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        if res.returncode != 0:
+            raise RuntimeError(f"FFmpeg failed: {res.stderr[-200:]}")
 
-  const boxes = parseBoxes(buf, 0, buf.length);
-  const moov = boxes.find(b => b.type === "moov");
-  const mdat = boxes.find(b => b.type === "mdat");
-  if (!moov || !mdat) throw new Error("moov or mdat missing");
+        # Step 2: Custom Sample Table & Box Modification
+        with open(remux_path, 'rb') as f:
+            buf = f.read()
 
-  const traks = (moov.children || []).filter(b => b.type === "trak");
-  const vTrak = traks.find(t => isVideoTrak(buf, t));
-  if (!vTrak) throw new Error("Video track missing");
+        boxes = parse_boxes(buf, 0, len(buf))
+        moov = next((b for b in boxes if b['type'] == 'moov'), None)
+        mdat = next((b for b in boxes if b['type'] == 'mdat'), None)
+        if not moov or not mdat:
+            raise RuntimeError("moov or mdat box missing")
 
-  const stbl = childPath(vTrak, ["mdia", "minf", "stbl"]);
-  const stsz = findChild(stbl, "stsz");
-  const sampleCount = u32(payload(buf, stsz), 8);
+        traks = [b for b in (moov.get('children') or []) if b['type'] == 'trak']
+        v_trak = next((t for t in traks if is_video_trak(buf, t)), None)
+        if not v_trak:
+            raise RuntimeError("Video track missing")
 
-  const totalSamples = Math.floor(sampleCount * 20 / 3);
-  const addCount = Math.max(0, totalSamples - sampleCount);
+        stbl = child_path(v_trak, ["mdia", "minf", "stbl"])
+        stsz = find_child(stbl, "stsz")
+        sample_count = u32(payload(buf, stsz), 8)
 
-  let activeTrak = null;
-  function walkMoov(b, shift, fakeOff) {
-    if (b.type === "udta") return null;
-    if (b.type === "mdhd") return patchMdhdLang(buf, b);
-    if (b.type === "hdlr") return patchHdlrName(buf, b);
-    
-    const isVideo = activeTrak === vTrak;
-    if (isVideo && b.type === "stsz") return patchStsz(buf, b, addCount);
-    if (isVideo && b.type === "stts") return raw(buf, b);
-    if (isVideo && b.type === "stsc" && addCount > 0) {
-      const stco = findChild(stbl, "stco") || findChild(stbl, "co64");
-      return patchStsc(buf, b, u32(payload(buf, stco), 4));
-    }
-    if (b.type === "stco") return patchStco(buf, b, shift, fakeOff, addCount);
-    if (b.type === "co64") return patchCo64(buf, b, shift, fakeOff, addCount);
+        total_samples = (sample_count * 20) // 3
+        add_count = max(0, total_samples - sample_count)
 
-    if (b.children) {
-      const parts = [];
-      if (b.type === "meta") parts.push(payload(buf, b).subarray(0, 4));
-      for (const child of b.children) {
-        const prevTrak = activeTrak;
-        if (child.type === "trak") activeTrak = child;
-        const patched = walkMoov(child, shift, fakeOff);
-        activeTrak = prevTrak;
-        if (patched) parts.push(patched);
-      }
-      return box(b.type, Buffer.concat(parts));
-    }
-    return raw(buf, b);
-  }
+        active_trak = [None]
 
-  let endPos = mdat.end;
-  let newMoov = walkMoov(moov, 0, endPos);
-  let diff = newMoov.length - raw(buf, moov).length;
-  endPos = mdat.end + diff;
-  newMoov = walkMoov(moov, diff, endPos);
+        def walk_moov(b_obj, shift, fake_off):
+            if b_obj['type'] == 'udta':
+                return None
+            if b_obj['type'] == 'mdhd':
+                return patch_mdhd_lang(buf, b_obj)
+            if b_obj['type'] == 'hdlr':
+                return patch_hdlr_name(buf, b_obj)
 
-  const mdatPayload = buf.subarray(mdat.start + 8, mdat.end);
-  const newMdat = addCount > 0 
-    ? Buffer.concat([w32(8 + mdatPayload.length + 8), Buffer.from("mdat", "latin1"), mdatPayload, FAKE_SAMPLE])
-    : raw(buf, mdat);
+            is_video = (active_trak[0] == v_trak)
+            if is_video and b_obj['type'] == 'stsz':
+                return patch_stsz(buf, b_obj, add_count)
+            if is_video and b_obj['type'] == 'stts':
+                return raw(buf, b_obj)
+            if is_video and b_obj['type'] == 'stsc' and add_count > 0:
+                stco_box = find_child(stbl, "stco") or find_child(stbl, "co64")
+                return patch_stsc(buf, b_obj, u32(payload(buf, stco_box), 4))
+            if b_obj['type'] == 'stco':
+                return patch_stco(buf, b_obj, shift, fake_off, add_count)
+            if b_obj['type'] == 'co64':
+                return patch_co64(buf, b_obj, shift, fake_off, add_count)
 
-  const outBoxes = [];
-  const freeBox = Buffer.concat([w32(8), Buffer.from("free", "latin1")]);
-  for (const b of boxes) {
-    if (b.type === "ftyp") { outBoxes.push(raw(buf, b)); outBoxes.push(freeBox); }
-    else if (b.type === "moov") outBoxes.push(newMoov);
-    else if (b.type === "mdat") outBoxes.push(newMdat);
-    else if (b.type === "free" || b.type === "wide") continue;
-    else outBoxes.push(raw(buf, b));
-  }
+            if b_obj.get('children'):
+                parts = []
+                if b_obj['type'] == 'meta':
+                    parts.append(payload(buf, b_obj)[:4])
+                for child in b_obj['children']:
+                    prev_trak = active_trak[0]
+                    if child['type'] == 'trak':
+                        active_trak[0] = child
+                    patched = walk_moov(child, shift, fake_off)
+                    active_trak[0] = prev_trak
+                    if patched:
+                        parts.append(patched)
+                return box(b_obj['type'], b''.join(parts))
 
-  fs.writeFileSync(outputPath, Buffer.concat(outBoxes));
-  console.log("Successfully patched without FFmpeg:", outputPath);
-}
+            return raw(buf, b_obj)
 
-const args = process.argv.slice(2);
-if (args.length < 2) {
-  console.log("Usage: node patcher.js <input_mp4> <output_mp4>");
-  process.exit(1);
-}
+        end_pos = mdat['end']
+        new_moov = walk_moov(moov, 0, end_pos)
+        diff = len(new_moov) - len(raw(buf, moov))
+        end_pos = mdat['end'] + diff
+        new_moov = walk_moov(moov, diff, end_pos)
 
-runPatcher(args[0], args[1]).catch(console.error);
+        mdat_payload = buf[mdat['start'] + 8 : mdat['end']]
+        if add_count > 0:
+            new_mdat = w32(8 + len(mdat_payload) + 8) + b'mdat' + mdat_payload + FAKE_SAMPLE
+        else:
+            new_mdat = raw(buf, mdat)
+
+        out_boxes = []
+        free_box = w32(8) + b'free'
+        for b in boxes:
+            if b['type'] == 'ftyp':
+                out_boxes.append(raw(buf, b))
+                out_boxes.append(free_box)
+            elif b['type'] == 'moov':
+                out_boxes.append(new_moov)
+            elif b['type'] == 'mdat':
+                out_boxes.append(new_mdat)
+            elif b['type'] in ('free', 'wide'):
+                continue
+            else:
+                out_boxes.append(raw(buf, b))
+
+        with open(output_path, 'wb') as f:
+            f.write(b''.join(out_boxes))
+
+    finally:
+        if os.path.exists(remux_path):
+            try: os.remove(remux_path)
+            except Exception: pass
+
+if __name__ == '__main__':
+    if len(sys.argv) < 3:
+        print("Usage: python patcher.py <input.mp4> <output.mp4>")
+        sys.exit(1)
+    process_video(sys.argv[1], sys.argv[2])
