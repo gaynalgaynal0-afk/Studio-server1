@@ -1,15 +1,6 @@
 const fs = require("fs");
 const path = require("path");
-const { FFmpeg } = require("@ffmpeg/ffmpeg");
-const { toBlobURL } = require("@ffmpeg/util");
 
-// Direct release URL to your 30.6MB ffmpeg-core.wasm file
-const GITHUB_WASM_URL = "https://github.com/gaynalgaynal0-afk/JV-60FPS/releases/download/main/ffmpeg-core.wasm";
-
-let ffmpegInstance = null;
-let isInitializing = null;
-
-// Helper MP4 Box Parsing Constants & Functions
 const CONTAINERS = new Set(["moov", "trak", "mdia", "minf", "stbl", "edts", "dinf", "udta", "meta", "ilst"]);
 const FAKE_SAMPLE = Buffer.from([0, 0, 0, 4, 0, 0, 0, 0]);
 
@@ -60,6 +51,69 @@ function childPath(parent, pathArr) {
   return curr;
 }
 
+// --- Step 1: Pure JS Remux (Faststart Offset Adjustment) ---
+function updateChunkOffsets(buf, b, shift) {
+  const p = payload(buf, b);
+  const hdr = p.subarray(0, 4);
+  const count = u32(p, 4);
+
+  if (b.type === "stco") {
+    const out = Buffer.alloc(8 + count * 4);
+    hdr.copy(out, 0);
+    out.writeUInt32BE(count, 4);
+    for (let i = 0, off = 8; i < count; i++, off += 4) {
+      out.writeUInt32BE((u32(p, off) + shift) >>> 0, 8 + i * 4);
+    }
+    return box("stco", out);
+  } else if (b.type === "co64") {
+    const out = Buffer.alloc(8 + count * 8);
+    hdr.copy(out, 0);
+    out.writeUInt32BE(count, 4);
+    for (let i = 0, off = 8; i < count; i++, off += 8) {
+      out.writeBigUInt64BE(BigInt(u64(p, off) + shift), 8 + i * 8);
+    }
+    return box("co64", out);
+  }
+  return raw(buf, b);
+}
+
+function remuxFaststart(inputBuf) {
+  const boxes = parseBoxes(inputBuf, 0, inputBuf.length);
+  const ftyp = boxes.find(b => b.type === "ftyp");
+  const moov = boxes.find(b => b.type === "moov");
+  const mdat = boxes.find(b => b.type === "mdat");
+
+  if (!moov || !mdat) return inputBuf;
+
+  function shiftMoovOffsets(b, shift) {
+    if (b.type === "udta") return null;
+    if (b.type === "stco" || b.type === "co64") return updateChunkOffsets(inputBuf, b, shift);
+    if (b.children) {
+      const parts = [];
+      if (b.type === "meta") parts.push(payload(inputBuf, b).subarray(0, 4));
+      for (const child of b.children) {
+        const patched = shiftMoovOffsets(child, shift);
+        if (patched) parts.push(patched);
+      }
+      return box(b.type, Buffer.concat(parts));
+    }
+    return raw(inputBuf, b);
+  }
+
+  let shiftedMoov = shiftMoovOffsets(moov, 0);
+  if (moov.start > mdat.start) {
+    shiftedMoov = shiftMoovOffsets(moov, shiftedMoov.length);
+  }
+
+  const outBoxes = [];
+  if (ftyp) outBoxes.push(raw(inputBuf, ftyp));
+  outBoxes.push(shiftedMoov);
+  outBoxes.push(raw(inputBuf, mdat));
+
+  return Buffer.concat(outBoxes);
+}
+
+// --- Step 2: Patch Sample Tables & Metadata ---
 function isVideoTrak(buf, trak) {
   const hdlr = childPath(trak, ["mdia", "hdlr"]);
   return Boolean(hdlr && payload(buf, hdlr).toString("latin1", 8, 12) === "vide");
@@ -151,53 +205,11 @@ function patchCo64(buf, b, shift, fakeOffset, addCount) {
   return box("co64", out);
 }
 
-// Singleton FFmpeg WASM loader
-async function getFFmpeg() {
-  if (ffmpegInstance) return ffmpegInstance;
-  if (isInitializing) return isInitializing;
+async function runPatcher(inputPath, outputPath) {
+  // Read and perform in-memory faststart remux without FFmpeg
+  const rawInput = fs.readFileSync(inputPath);
+  const buf = remuxFaststart(rawInput);
 
-  isInitializing = (async () => {
-    console.log("Downloading/Loading ffmpeg-core.wasm from GitHub Releases...");
-    const ffmpeg = new FFmpeg();
-    const coreURL = await toBlobURL(GITHUB_WASM_URL, "application/wasm");
-
-    await ffmpeg.load({ coreURL });
-    console.log("FFmpeg WASM successfully loaded and cached!");
-    ffmpegInstance = ffmpeg;
-    return ffmpegInstance;
-  })();
-
-  return isInitializing;
-}
-
-// Main processing function
-async function processVideo(inputPath, outputPath) {
-  const ffmpeg = await getFFmpeg();
-  const inputFileData = fs.readFileSync(inputPath);
-  
-  const inFilename = `input_${Date.now()}.mp4`;
-  const remuxFilename = `remux_${Date.now()}.mp4`;
-
-  // Step 1: Perform Faststart Remux via FFmpeg WASM
-  await ffmpeg.writeFile(inFilename, inputFileData);
-  await ffmpeg.exec([
-    "-i", inFilename,
-    "-map", "0",
-    "-c", "copy",
-    "-map_metadata", "-1",
-    "-map_chapters", "-1",
-    "-brand", "isom",
-    "-movflags", "+faststart",
-    "-video_track_timescale", "90000",
-    remuxFilename
-  ]);
-
-  const remuxedBytes = await ffmpeg.readFile(remuxFilename);
-  await ffmpeg.deleteFile(inFilename);
-  await ffmpeg.deleteFile(remuxFilename);
-
-  // Step 2: Custom Sample Table Box Patching on the remuxed buffer
-  const buf = Buffer.from(remuxedBytes);
   const boxes = parseBoxes(buf, 0, buf.length);
   const moov = boxes.find(b => b.type === "moov");
   const mdat = boxes.find(b => b.type === "mdat");
@@ -267,19 +279,13 @@ async function processVideo(inputPath, outputPath) {
   }
 
   fs.writeFileSync(outputPath, Buffer.concat(outBoxes));
-  console.log("Successfully processed video:", outputPath);
+  console.log("Successfully patched without FFmpeg:", outputPath);
 }
 
-// CLI Execution
 const args = process.argv.slice(2);
 if (args.length < 2) {
   console.log("Usage: node patcher.js <input_mp4> <output_mp4>");
   process.exit(1);
 }
 
-processVideo(args[0], args[1])
-  .then(() => process.exit(0))
-  .catch((err) => {
-    console.error("Error patching video:", err);
-    process.exit(1);
-  });
+runPatcher(args[0], args[1]).catch(console.error);
