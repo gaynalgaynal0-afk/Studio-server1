@@ -1,6 +1,6 @@
 """
-JV-60FPS Server
-Executes FFmpeg encoding followed by node patcher.js
+JV Fast Server (Render Deployment)
+Passes input file directly to node patcher.js
 """
 
 import os
@@ -21,7 +21,7 @@ def cors(r):
 
 @app.route('/')
 def index():
-    return jsonify({"status": "ok", "service": "JV 60FPS Server (Node Patcher)"})
+    return jsonify({"status": "ok", "service": "JV Fast Patcher (studio-server1)"})
 
 @app.route('/health')
 def health():
@@ -44,41 +44,21 @@ def patch():
         return jsonify({"error": "File too large (max 500MB)"}), 413
 
     in_tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
-    encoded_tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
     out_tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
 
     in_path = in_tmp.name
-    encoded_path = encoded_tmp.name
     out_path = out_tmp.name
 
     try:
+        # Save uploaded video
         in_tmp.write(raw)
         in_tmp.flush()
         in_tmp.close()
-        encoded_tmp.close()
         out_tmp.close()
 
-        # Step 1: Run FFmpeg Encoding
-        ffmpeg_cmd = [
-            "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
-            "-i", in_path,
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
-            "-profile:v", "high", "-level", "4.2",
-            "-b:v", "12M", "-maxrate", "14M", "-bufsize", "18M",
-            "-vf", "scale=1080:-2,fps=60,format=yuv420p,unsharp=5:5:0.8:3:3:0.4",
-            "-g", "120", "-keyint_min", "120", "-sc_threshold", "0",
-            "-c:a", "aac", "-b:a", "256k", "-ar", "48000",
-            "-movflags", "+faststart",
-            encoded_path
-        ]
-
-        ffmpeg_res = subprocess.run(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if ffmpeg_res.returncode != 0:
-            raise RuntimeError(f"FFmpeg encoding failed: {ffmpeg_res.stderr.strip()}")
-
-        # Step 2: Run patcher.js using Node
+        # Run patcher.js using Node
         script_path = os.path.join(os.path.dirname(__file__), "patcher.js")
-        node_cmd = ["node", script_path, encoded_path, out_path]
+        node_cmd = ["node", script_path, in_path, out_path]
 
         node_res = subprocess.run(node_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if node_res.returncode != 0:
@@ -89,7 +69,7 @@ def patch():
 
         @after_this_request
         def cleanup(response):
-            for path in (in_path, encoded_path, out_path):
+            for path in (in_path, out_path):
                 try:
                     if os.path.exists(path):
                         os.remove(path)
@@ -102,7 +82,7 @@ def patch():
         return resp
 
     except Exception as e:
-        for path in (in_path, encoded_path, out_path):
+        for path in (in_path, out_path):
             if os.path.exists(path):
                 try:
                     os.remove(path)
