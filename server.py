@@ -1,8 +1,3 @@
-"""
-JV MP4 Server
-Handles post requests by delegating to patcher.js
-"""
-
 import os
 import uuid
 import tempfile
@@ -21,15 +16,7 @@ def cors(r):
 
 @app.route('/')
 def index():
-    return jsonify({"status": "ok", "service": "JV MP4 Patcher Server"})
-
-@app.route('/health')
-def health():
-    return jsonify({"status": "ok"})
-
-@app.route('/patch', methods=['OPTIONS'])
-def patch_options():
-    return '', 204
+    return jsonify({"status": "ok", "service": "JV 60FPS Server Ready"})
 
 @app.route('/patch', methods=['POST'])
 def patch():
@@ -39,9 +26,7 @@ def patch():
 
     raw = f.read()
     if not raw:
-        return jsonify({"error": "Empty file"}), 400
-    if len(raw) > MAX_SIZE:
-        return jsonify({"error": "File exceeds max limit of 500MB"}), 413
+        return jsonify({"error": "File is empty"}), 400
 
     in_tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
     out_tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
@@ -50,31 +35,31 @@ def patch():
     out_path = out_tmp.name
 
     try:
-        # Save raw uploaded bytes to a temporary file
         in_tmp.write(raw)
         in_tmp.flush()
         in_tmp.close()
         out_tmp.close()
 
-        # Execute Node.js script
-        script_path = os.path.join(os.path.dirname(__file__), "patcher.js")
-        node_cmd = ["node", script_path, in_path, out_path]
+        script_path = os.path.join(os.path.dirname(__file__), "patcher.py")
+        res = subprocess.run(
+            ["python", script_path, in_path, out_path],
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
 
-        node_res = subprocess.run(node_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if node_res.returncode != 0:
-            raise RuntimeError(f"Node patcher error: {node_res.stderr.strip()}")
+        if res.returncode != 0:
+            raise RuntimeError(f"Patcher failed: {res.stderr.strip()}")
 
         file_id = uuid.uuid4().hex
         out_name = f'jv_{file_id}.mp4'
 
         @after_this_request
         def cleanup(response):
-            for path in (in_path, out_path):
-                try:
-                    if os.path.exists(path):
-                        os.remove(path)
-                except Exception:
-                    pass
+            for p in (in_path, out_path):
+                if os.path.exists(p):
+                    try: os.remove(p)
+                    except Exception: pass
             return response
 
         resp = send_file(out_path, mimetype='video/mp4', as_attachment=True, download_name=out_name)
@@ -82,12 +67,10 @@ def patch():
         return resp
 
     except Exception as e:
-        for path in (in_path, out_path):
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
+        for p in (in_path, out_path):
+            if os.path.exists(p):
+                try: os.remove(p)
+                except Exception: pass
         return jsonify({"error": str(e)}), 422
 
 if __name__ == '__main__':
