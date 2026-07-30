@@ -1,27 +1,27 @@
 """
-JV Fast Server (Render Deployment)
-Passes input file directly to node patcher.js
+JV-60FPS Server
+Calls patcher.py (replicates patcher.js behavior directly in Python)
 """
 
 import os
 import uuid
 import tempfile
-import subprocess
 from flask import Flask, request, send_file, jsonify, after_this_request
+from patcher import patch_video_pipeline
 
 app = Flask(__name__)
 MAX_SIZE = 500 * 1024 * 1024  # 500 MB limit
 
 @app.after_request
 def cors(r):
-    r.headers['Access-Control-Allow-Origin'] = '*'
+    r.headers['Access-Control-Allow-Origin']  = '*'
     r.headers['Access-Control-Allow-Headers'] = 'Content-Type'
     r.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
     return r
 
 @app.route('/')
 def index():
-    return jsonify({"status": "ok", "service": "JV Fast Patcher (studio-server1)"})
+    return jsonify({"status": "ok", "service": "JV MP4 Patcher Server"})
 
 @app.route('/health')
 def health():
@@ -43,52 +43,33 @@ def patch():
     if len(raw) > MAX_SIZE:
         return jsonify({"error": "File too large (max 500MB)"}), 413
 
-    in_tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
-    out_tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
-
-    in_path = in_tmp.name
-    out_path = out_tmp.name
-
     try:
-        # Save uploaded video
-        in_tmp.write(raw)
-        in_tmp.flush()
-        in_tmp.close()
-        out_tmp.close()
-
-        # Run patcher.js using Node
-        script_path = os.path.join(os.path.dirname(__file__), "patcher.js")
-        node_cmd = ["node", script_path, in_path, out_path]
-
-        node_res = subprocess.run(node_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if node_res.returncode != 0:
-            raise RuntimeError(f"Node patcher failed: {node_res.stderr.strip()}")
-
-        file_id = uuid.uuid4().hex
-        out_name = f'jv_{file_id}.mp4'
-
-        @after_this_request
-        def cleanup(response):
-            for path in (in_path, out_path):
-                try:
-                    if os.path.exists(path):
-                        os.remove(path)
-                except Exception:
-                    pass
-            return response
-
-        resp = send_file(out_path, mimetype='video/mp4', as_attachment=True, download_name=out_name)
-        resp.headers['X-File-Id'] = file_id
-        return resp
-
+        output, real_samples, fake_samples = patch_video_pipeline(raw)
     except Exception as e:
-        for path in (in_path, out_path):
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
         return jsonify({"error": str(e)}), 422
+
+    file_id  = uuid.uuid4().hex
+    out_name = f'jv_{file_id}.mp4'
+
+    tmp = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False)
+    tmp.write(output)
+    tmp.flush()
+    tmp.close()
+
+    @after_this_request
+    def cleanup(response):
+        if os.path.exists(tmp.name):
+            try:
+                os.remove(tmp.name)
+            except Exception:
+                pass
+        return response
+
+    resp = send_file(tmp.name, mimetype='video/mp4', as_attachment=True, download_name=out_name)
+    resp.headers['X-File-Id']      = file_id
+    resp.headers['X-Real-Samples'] = str(real_samples)
+    resp.headers['X-Fake-Samples'] = str(fake_samples)
+    return resp
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
