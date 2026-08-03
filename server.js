@@ -27,15 +27,11 @@ const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 
-// Configure Multer for temporary upload storage. The hard ceiling here is
-// just the multer-layer safety net (highest possible tier limit) — actual
-// per-user enforcement happens after the file lands, based on their tier.
 const upload = multer({
   dest: "/tmp/",
-  limits: { fileSize: PREMIUM_LIMIT_BYTES + (5 * 1024 * 1024) }, // small buffer
+  limits: { fileSize: PREMIUM_LIMIT_BYTES + (5 * 1024 * 1024) },
 });
 
-// Configure S3 Client for Cloudflare R2
 const s3 = new S3Client({
   region: "auto",
   endpoint: process.env.R2_ACCOUNT_ID
@@ -45,20 +41,13 @@ const s3 = new S3Client({
     accessKeyId: process.env.R2_ACCESS_KEY_ID || "af58a7c90330ad646caa39b955ffb229",
     secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || "246ba1ee7dbab9059ba723dcbd126c766426a2d1e5e47e182b35f51a076b1683",
   },
-  // Without this, the SDK generates virtual-hosted-style URLs
-  // (bucket.account.r2.cloudflarestorage.com) but signs the request as if
-  // it were path-style — R2 then rejects the mismatched signature with a
-  // 403. Path-style (account.r2.cloudflarestorage.com/bucket/key) is what
-  // R2 actually expects.
   forcePathStyle: true,
 });
 
-// Helper: Upload file to Cloudflare R2 and return a 1-hour presigned URL
 async function uploadToR2AndGetSignedUrl(filePath, destinationKey) {
   const fileStream = fs.createReadStream(filePath);
   const bucketName = process.env.R2_BUCKET_NAME || "jv-60fps-studio-server-bucket";
 
-  // Upload object to R2
   const putCmd = new PutObjectCommand({
     Bucket: bucketName,
     Key: destinationKey,
@@ -67,7 +56,6 @@ async function uploadToR2AndGetSignedUrl(filePath, destinationKey) {
   });
   await s3.send(putCmd);
 
-  // Generate 1-hour temporary presigned GET URL
   const getCmd = new GetObjectCommand({
     Bucket: bucketName,
     Key: destinationKey,
@@ -81,6 +69,12 @@ app.get("/", (req, res) => {
   res.json({ status: "ok", service: "JV Lightweight Server" });
 });
 
+// ── NEW: Tier check endpoint — called by the extension popup ──────
+app.get("/tier/:uid", (req, res) => {
+  const { tier, limitMB } = getTier(req.params.uid);
+  res.json({ tier, limit_mb: limitMB });
+});
+
 app.post("/patch", upload.single("video"), async (req, res) => {
   const file = req.file || (req.files && req.files.file && req.files.file[0]);
   if (!file) {
@@ -92,8 +86,6 @@ app.post("/patch", upload.single("video"), async (req, res) => {
 
   const inputPath = file.path;
 
-  // Enforce the tier's actual limit here — multer's own limit above is
-  // just a ceiling to allow premium-sized files through at all.
   if (file.size > limitBytes) {
     if (fs.existsSync(inputPath)) fs.unlink(inputPath, () => {});
     return res.status(413).json({
@@ -116,7 +108,6 @@ app.post("/patch", upload.single("video"), async (req, res) => {
 
   const scriptPath = path.join(__dirname, "patcher.py");
 
-  // Run python patcher script
   execFile(
     "python3",
     [scriptPath, inputPath, outputPath],
@@ -147,8 +138,6 @@ app.post("/patch", upload.single("video"), async (req, res) => {
   );
 });
 
-// Catches multer's own errors (e.g. file bigger than the outer safety-net
-// limit) so they come back as JSON instead of a raw crash/HTML error.
 app.use((err, req, res, next) => {
   if (err && err.code === "LIMIT_FILE_SIZE") {
     return res.status(413).json({ error: `File exceeds the maximum allowed size (${(PREMIUM_LIMIT_BYTES / (1024*1024)).toFixed(0)}MB)` });
