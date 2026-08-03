@@ -29,6 +29,12 @@ const s3 = new S3Client({
     accessKeyId: process.env.R2_ACCESS_KEY_ID || "af58a7c90330ad646caa39b955ffb229",
     secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || "246ba1ee7dbab9059ba723dcbd126c766426a2d1e5e47e182b35f51a076b1683",
   },
+  // Without this, the SDK generates virtual-hosted-style URLs
+  // (bucket.account.r2.cloudflarestorage.com) but signs the request as if
+  // it were path-style — R2 then rejects the mismatched signature with a
+  // 403. Path-style (account.r2.cloudflarestorage.com/bucket/key) is what
+  // R2 actually expects.
+  forcePathStyle: true,
 });
 
 // Helper: Upload file to Cloudflare R2 and return a 1-hour presigned URL
