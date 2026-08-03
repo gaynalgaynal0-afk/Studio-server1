@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 
-// Configure Multer for temporary storage in /tmp
+// Configure Multer for temporary upload storage
 const upload = multer({
   dest: "/tmp/",
   limits: { fileSize: 500 * 1024 * 1024 }, // 500 MB limit
@@ -31,12 +31,12 @@ const s3 = new S3Client({
   },
 });
 
-// Helper: Upload file to R2 and return a 1-hour presigned download URL
+// Helper: Upload file to Cloudflare R2 and return a 1-hour presigned URL
 async function uploadToR2AndGetSignedUrl(filePath, destinationKey) {
   const fileStream = fs.createReadStream(filePath);
   const bucketName = process.env.R2_BUCKET_NAME || "jv-60fps-studio-server-bucket";
 
-  // 1. Upload the patched video file
+  // Upload object to R2
   const putCmd = new PutObjectCommand({
     Bucket: bucketName,
     Key: destinationKey,
@@ -45,7 +45,7 @@ async function uploadToR2AndGetSignedUrl(filePath, destinationKey) {
   });
   await s3.send(putCmd);
 
-  // 2. Generate a presigned URL valid for 3600 seconds (1 hour)
+  // Generate 1-hour temporary presigned GET URL
   const getCmd = new GetObjectCommand({
     Bucket: bucketName,
     Key: destinationKey,
@@ -56,3 +56,57 @@ async function uploadToR2AndGetSignedUrl(filePath, destinationKey) {
 }
 
 app.get("/", (req, res) => {
+  res.json({ status: "ok", service: "JV Lightweight Server" });
+});
+
+app.post("/patch", upload.single("video"), async (req, res) => {
+  const file = req.file || (req.files && req.files.file && req.files.file[0]);
+  if (!file) {
+    return res.status(400).json({ error: "No video file provided" });
+  }
+
+  const inputPath = file.path;
+  const fileId = crypto.randomBytes(16).toString("hex");
+  const outputPath = path.join("/tmp", `patched_${fileId}.mp4`);
+  const r2ObjectKey = `outputs/jv_${fileId}.mp4`;
+
+  const cleanup = () => {
+    [inputPath, outputPath].forEach((p) => {
+      if (fs.existsSync(p)) fs.unlink(p, () => {});
+    });
+  };
+
+  const scriptPath = path.join(__dirname, "patcher.py");
+
+  // Run python patcher script
+  execFile(
+    "python3",
+    [scriptPath, inputPath, outputPath],
+    { timeout: 300000 },
+    async (error, stdout, stderr) => {
+      if (error) {
+        cleanup();
+        return res.status(422).json({ error: `Patch failed: ${stderr || error.message}` });
+      }
+
+      try {
+        console.log("Uploading output to R2 and generating presigned link...");
+        const signedUrl = await uploadToR2AndGetSignedUrl(outputPath, r2ObjectKey);
+        cleanup();
+
+        return res.json({
+          status: "success",
+          file_id: fileId,
+          download_url: signedUrl,
+        });
+      } catch (uploadErr) {
+        cleanup();
+        return res.status(500).json({ error: `R2 Upload failed: ${uploadErr.message}` });
+      }
+    }
+  );
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server listening on port ${PORT}`);
+});
