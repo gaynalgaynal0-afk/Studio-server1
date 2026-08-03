@@ -3,7 +3,7 @@ const multer = require("multer");
 const cors = require("cors");
 const path = require("path");
 const fs = require("fs");
-const { execFile, exec } = require("child_process");
+const { execFile } = require("child_process");
 const crypto = require("crypto");
 const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 
@@ -12,10 +12,10 @@ const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 
-// Configure Multer for temporary upload storage
+// Configure Multer for temporary storage
 const upload = multer({
   dest: "/tmp/",
-  limits: { fileSize: 500 * 1024 * 1024 }, // 500 MB limit
+  limits: { fileSize: 500 * 1024 * 1024 },
 });
 
 // Configure S3 Client for Cloudflare R2
@@ -30,7 +30,6 @@ const s3 = new S3Client({
   },
 });
 
-// Helper: Upload file to Cloudflare R2
 async function uploadToR2(filePath, destinationKey) {
   const fileStream = fs.createReadStream(filePath);
   const bucketName = process.env.R2_BUCKET_NAME || "jv-60fps-studio-server-bucket";
@@ -49,7 +48,7 @@ async function uploadToR2(filePath, destinationKey) {
 }
 
 app.get("/", (req, res) => {
-  res.json({ status: "ok", service: "JV 60FPS R2 & 1080p Server" });
+  res.json({ status: "ok", service: "JV Lightweight Server" });
 });
 
 app.post("/patch", upload.single("video"), async (req, res) => {
@@ -60,57 +59,41 @@ app.post("/patch", upload.single("video"), async (req, res) => {
 
   const inputPath = file.path;
   const fileId = crypto.randomBytes(16).toString("hex");
-  const patchedPath = path.join("/tmp", `patched_${fileId}.mp4`);
-  const finalPath = path.join("/tmp", `out_1080p60_${fileId}.mp4`);
+  const outputPath = path.join("/tmp", `patched_${fileId}.mp4`);
   const r2ObjectKey = `outputs/jv_${fileId}.mp4`;
 
-  // Function to delete temp files safely
   const cleanup = () => {
-    [inputPath, patchedPath, finalPath].forEach((p) => {
+    [inputPath, outputPath].forEach((p) => {
       if (fs.existsSync(p)) fs.unlink(p, () => {});
     });
   };
 
   const scriptPath = path.join(__dirname, "patcher.py");
 
-  // Step 1: Run Python Patcher
+  // Fast patch execution only
   execFile(
     "python3",
-    [scriptPath, inputPath, patchedPath],
+    [scriptPath, inputPath, outputPath],
     { timeout: 300000 },
-    (error, stdout, stderr) => {
+    async (error, stdout, stderr) => {
       if (error) {
         cleanup();
         return res.status(422).json({ error: `Patch failed: ${stderr || error.message}` });
       }
 
-      // Step 2: Run FFmpeg Re-encode to 1080p 60FPS @ 20Mbps (Preserving Aspect Ratio)
-      const ffmpegCmd = `ffmpeg -y -i "${patchedPath}" -vf "scale='if(gt(a,16/9),1920,-2)':'if(gt(a,16/9),-2,1080)',fps=60" -c:v libx264 -preset fast -b:v 20M -maxrate 22M -bufsize 40M -c:a copy -movflags +faststart "${finalPath}"`;
+      try {
+        const r2Url = await uploadToR2(outputPath, r2ObjectKey);
+        cleanup();
 
-      exec(ffmpegCmd, { timeout: 600000 }, async (ffErr, ffStdout, ffStderr) => {
-        if (ffErr) {
-          cleanup();
-          return res.status(500).json({ error: `FFmpeg re-encoding failed: ${ffStderr || ffErr.message}` });
-        }
-
-        try {
-          // Step 3: Upload output to Cloudflare R2
-          console.log("Uploading 1080p 60FPS video to Cloudflare R2...");
-          const r2Url = await uploadToR2(finalPath, r2ObjectKey);
-          
-          cleanup();
-
-          // Step 4: Return JSON response to client / extension
-          return res.json({
-            status: "success",
-            file_id: fileId,
-            download_url: r2Url,
-          });
-        } catch (uploadErr) {
-          cleanup();
-          return res.status(500).json({ error: `R2 Upload failed: ${uploadErr.message}` });
-        }
-      });
+        return res.json({
+          status: "success",
+          file_id: fileId,
+          download_url: r2Url,
+        });
+      } catch (uploadErr) {
+        cleanup();
+        return res.status(500).json({ error: `R2 Upload failed: ${uploadErr.message}` });
+      }
     }
   );
 });
