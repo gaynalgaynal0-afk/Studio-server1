@@ -8,15 +8,31 @@ const crypto = require("crypto");
 const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
+const PREMIUM_UIDS = require("./premium-check.js");
+
+const FREE_LIMIT_BYTES    = 70  * 1024 * 1024;
+const PREMIUM_LIMIT_BYTES = 120 * 1024 * 1024;
+
+function getTier(uid) {
+  const isPremium = !!uid && PREMIUM_UIDS.includes(String(uid));
+  return {
+    tier: isPremium ? "premium" : "free",
+    limitBytes: isPremium ? PREMIUM_LIMIT_BYTES : FREE_LIMIT_BYTES,
+    limitMB: isPremium ? 120 : 70,
+  };
+}
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 
-// Configure Multer for temporary upload storage
+// Configure Multer for temporary upload storage. The hard ceiling here is
+// just the multer-layer safety net (highest possible tier limit) — actual
+// per-user enforcement happens after the file lands, based on their tier.
 const upload = multer({
   dest: "/tmp/",
-  limits: { fileSize: 500 * 1024 * 1024 }, // 500 MB limit
+  limits: { fileSize: PREMIUM_LIMIT_BYTES + (5 * 1024 * 1024) }, // small buffer
 });
 
 // Configure S3 Client for Cloudflare R2
@@ -71,7 +87,23 @@ app.post("/patch", upload.single("video"), async (req, res) => {
     return res.status(400).json({ error: "No video file provided" });
   }
 
+  const uid = req.body && req.body.uid;
+  const { tier, limitBytes, limitMB } = getTier(uid);
+
   const inputPath = file.path;
+
+  // Enforce the tier's actual limit here — multer's own limit above is
+  // just a ceiling to allow premium-sized files through at all.
+  if (file.size > limitBytes) {
+    if (fs.existsSync(inputPath)) fs.unlink(inputPath, () => {});
+    return res.status(413).json({
+      error: `File exceeds the ${limitMB}MB limit for ${tier} users`,
+      tier,
+      limit_mb: limitMB,
+      file_mb: +(file.size / (1024 * 1024)).toFixed(1),
+    });
+  }
+
   const fileId = crypto.randomBytes(16).toString("hex");
   const outputPath = path.join("/tmp", `patched_${fileId}.mp4`);
   const r2ObjectKey = `outputs/jv_${fileId}.mp4`;
@@ -92,7 +124,7 @@ app.post("/patch", upload.single("video"), async (req, res) => {
     async (error, stdout, stderr) => {
       if (error) {
         cleanup();
-        return res.status(422).json({ error: `Patch failed: ${stderr || error.message}` });
+        return res.status(422).json({ error: `Patch failed: ${stderr || error.message}`, tier, limit_mb: limitMB });
       }
 
       try {
@@ -104,13 +136,27 @@ app.post("/patch", upload.single("video"), async (req, res) => {
           status: "success",
           file_id: fileId,
           download_url: signedUrl,
+          tier,
+          limit_mb: limitMB,
         });
       } catch (uploadErr) {
         cleanup();
-        return res.status(500).json({ error: `R2 Upload failed: ${uploadErr.message}` });
+        return res.status(500).json({ error: `R2 Upload failed: ${uploadErr.message}`, tier, limit_mb: limitMB });
       }
     }
   );
+});
+
+// Catches multer's own errors (e.g. file bigger than the outer safety-net
+// limit) so they come back as JSON instead of a raw crash/HTML error.
+app.use((err, req, res, next) => {
+  if (err && err.code === "LIMIT_FILE_SIZE") {
+    return res.status(413).json({ error: `File exceeds the maximum allowed size (${(PREMIUM_LIMIT_BYTES / (1024*1024)).toFixed(0)}MB)` });
+  }
+  if (err) {
+    return res.status(500).json({ error: err.message || "Unexpected server error" });
+  }
+  next();
 });
 
 app.listen(PORT, "0.0.0.0", () => {
