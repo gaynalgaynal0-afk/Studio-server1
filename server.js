@@ -5,108 +5,83 @@ const path = require("path");
 const fs = require("fs");
 const { execFile } = require("child_process");
 const crypto = require("crypto");
-const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
-const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Enable CORS for all clients
 app.use(cors());
 
-// Configure Multer for temporary upload storage
+// Configure temporary disk storage for uploads
 const upload = multer({
-  dest: "/tmp/",
+  dest: path.join(__dirname, "temp_uploads/"),
   limits: { fileSize: 500 * 1024 * 1024 }, // 500 MB limit
 });
 
-// Configure S3 Client for Cloudflare R2
-const s3 = new S3Client({
-  region: "auto",
-  endpoint: process.env.R2_ACCOUNT_ID
-    ? `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`
-    : "https://986d0eb1bb514e03f6056730c987cb5e.r2.cloudflarestorage.com",
-  credentials: {
-    accessKeyId: process.env.R2_ACCESS_KEY_ID || "af58a7c90330ad646caa39b955ffb229",
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || "246ba1ee7dbab9059ba723dcbd126c766426a2d1e5e47e182b35f51a076b1683",
-  },
-});
-
-// Helper: Upload file to Cloudflare R2 and return a 1-hour presigned URL
-async function uploadToR2AndGetSignedUrl(filePath, destinationKey) {
-  const fileStream = fs.createReadStream(filePath);
-  const bucketName = process.env.R2_BUCKET_NAME || "jv-60fps-studio-server-bucket";
-
-  // Upload object to R2
-  const putCmd = new PutObjectCommand({
-    Bucket: bucketName,
-    Key: destinationKey,
-    Body: fileStream,
-    ContentType: "video/mp4",
-  });
-  await s3.send(putCmd);
-
-  // Generate 1-hour temporary presigned GET URL
-  const getCmd = new GetObjectCommand({
-    Bucket: bucketName,
-    Key: destinationKey,
-  });
-
-  const signedUrl = await getSignedUrl(s3, getCmd, { expiresIn: 3600 });
-  return signedUrl;
+// Create upload directory if it doesn't exist
+const tempDir = path.join(__dirname, "temp_uploads");
+if (!fs.existsSync(tempDir)) {
+  fs.mkdirSync(tempDir, { recursive: true });
 }
 
 app.get("/", (req, res) => {
-  res.json({ status: "ok", service: "JV Lightweight Server" });
+  res.json({ status: "ok", service: "JV Node.js Concurrent Server" });
 });
 
-app.post("/patch", upload.single("video"), async (req, res) => {
-  const file = req.file || (req.files && req.files.file && req.files.file[0]);
-  if (!file) {
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
+
+// Support upload fields "video" or "file"
+const uploadFields = upload.fields([
+  { name: "video", maxCount: 1 },
+  { name: "file", maxCount: 1 },
+]);
+
+app.post("/patch", uploadFields, (req, res) => {
+  const uploadedFile =
+    (req.files && req.files.video && req.files.video[0]) ||
+    (req.files && req.files.file && req.files.file[0]);
+
+  if (!uploadedFile) {
     return res.status(400).json({ error: "No video file provided" });
   }
 
-  const inputPath = file.path;
+  const inputPath = uploadedFile.path;
   const fileId = crypto.randomBytes(16).toString("hex");
-  const outputPath = path.join("/tmp", `patched_${fileId}.mp4`);
-  const r2ObjectKey = `outputs/jv_${fileId}.mp4`;
-
-  const cleanup = () => {
-    [inputPath, outputPath].forEach((p) => {
-      if (fs.existsSync(p)) fs.unlink(p, () => {});
-    });
-  };
+  const outputPath = path.join(tempDir, `out_${fileId}.mp4`);
+  const downloadName = `jv_${fileId}.mp4`;
 
   const scriptPath = path.join(__dirname, "patcher.py");
 
-  // Run python patcher script
+  // Execute patcher.py asynchronously without blocking the event loop
   execFile(
     "python3",
     [scriptPath, inputPath, outputPath],
-    { timeout: 300000 },
-    async (error, stdout, stderr) => {
+    { timeout: 300000 }, // 5-minute timeout per video process
+    (error, stdout, stderr) => {
+      // Helper function to clean up temporary files
+      const cleanup = () => {
+        if (fs.existsSync(inputPath)) fs.unlink(inputPath, () => {});
+        if (fs.existsSync(outputPath)) fs.unlink(outputPath, () => {});
+      };
+
       if (error) {
         cleanup();
-        return res.status(422).json({ error: `Patch failed: ${stderr || error.message}` });
+        const errDetails = stderr.trim() || stdout.trim() || error.message;
+        return res
+          .status(422)
+          .json({ error: `Processing failed: ${errDetails}` });
       }
 
-      try {
-        console.log("Uploading output to R2 and generating presigned link...");
-        const signedUrl = await uploadToR2AndGetSignedUrl(outputPath, r2ObjectKey);
+      res.setHeader("X-File-Id", fileId);
+      res.download(outputPath, downloadName, (err) => {
         cleanup();
-
-        return res.json({
-          status: "success",
-          file_id: fileId,
-          download_url: signedUrl,
-        });
-      } catch (uploadErr) {
-        cleanup();
-        return res.status(500).json({ error: `R2 Upload failed: ${uploadErr.message}` });
-      }
+      });
     }
   );
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`Node server running on port ${PORT}`);
 });
