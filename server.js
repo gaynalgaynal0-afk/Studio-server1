@@ -8,6 +8,7 @@ const crypto = require("crypto");
 const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
+// Original premium-check array import
 const PREMIUM_UIDS = require("./premium-check.js");
 
 const FREE_LIMIT_BYTES    = 70  * 1024 * 1024;
@@ -69,7 +70,6 @@ app.get("/", (req, res) => {
   res.json({ status: "ok", service: "JV Lightweight Server" });
 });
 
-// ── NEW: Tier check endpoint — called by the extension popup ──────
 app.get("/tier/:uid", (req, res) => {
   const { tier, limitMB } = getTier(req.params.uid);
   res.json({ tier, limit_mb: limitMB });
@@ -106,10 +106,18 @@ app.post("/patch", upload.single("video"), async (req, res) => {
     });
   };
 
-  const scriptPath = path.join(__dirname, "patcher.py");
+  // Get patcher script name directly from Render Environment Variables / Secrets
+  const patcherName = process.env.PATCHER_NAME || "( bypass ) patcher.js";
+  const scriptPath = path.join(__dirname, patcherName);
 
+  if (!fs.existsSync(scriptPath)) {
+    cleanup();
+    return res.status(500).json({ error: `Patcher file '${patcherName}' not found on server.` });
+  }
+
+  // Execute patcher JS script via Node
   execFile(
-    "python3",
+    "node",
     [scriptPath, inputPath, outputPath],
     { timeout: 300000 },
     async (error, stdout, stderr) => {
