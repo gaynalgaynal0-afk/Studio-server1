@@ -1,14 +1,22 @@
+const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
+const ffprobeInstaller = require("@ffprobe-installer/ffprobe");
+const path = require("path");
+
+// Inject static ffmpeg & ffprobe into system PATH automatically
+const ffmpegDir = path.dirname(ffmpegInstaller.path);
+const ffprobeDir = path.dirname(ffprobeInstaller.path);
+process.env.PATH = `${ffmpegDir}:${ffprobeDir}:${process.env.PATH}`;
+
 const express = require("express");
 const multer = require("multer");
 const cors = require("cors");
-const path = require("path");
 const fs = require("fs");
 const { execFile } = require("child_process");
 const crypto = require("crypto");
 const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 
-// Original premium-check array import
+// Original premium-check array import (Untouched)
 const PREMIUM_UIDS = require("./premium-check.js");
 
 const FREE_LIMIT_BYTES    = 70  * 1024 * 1024;
@@ -106,16 +114,18 @@ app.post("/patch", upload.single("video"), async (req, res) => {
     });
   };
 
-  // Get patcher script name directly from Render Environment Variables / Secrets
+  // Get patcher script name from Render Secret / Environment Variable
   const patcherName = process.env.PATCHER_NAME || "( bypass ) patcher.js";
   const scriptPath = path.join(__dirname, patcherName);
 
   if (!fs.existsSync(scriptPath)) {
     cleanup();
-    return res.status(500).json({ error: `Patcher file '${patcherName}' not found on server.` });
+    return res.status(500).json({ error: `Patcher script '${patcherName}' not found on server.` });
   }
 
-  // Execute patcher JS script via Node
+  console.log(`Processing UID [${uid || "Guest"}] using patcher: ${patcherName}`);
+
+  // Execute the JavaScript patcher script via Node.js
   execFile(
     "node",
     [scriptPath, inputPath, outputPath],
