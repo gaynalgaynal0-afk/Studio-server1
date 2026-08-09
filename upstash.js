@@ -68,5 +68,3 @@ async function recordUpload(uid) {
 }
 
 module.exports = { getUploadInfo, recordUpload };
-EOF
-echo "Done"
