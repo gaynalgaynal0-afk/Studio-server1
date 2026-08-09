@@ -1,70 +1,69 @@
-// ── Upstash Redis REST helper ──────────────────────────────────────
-// Tracks upload counts per UID in a 7-day rolling window.
-// No npm packages needed — plain HTTPS fetch.
+// ── Upstash Redis — upload quota tracker ──────────────────────────
+// Free users:    3 uploads per 7 days
+// Premium users: unlimited
+//
+// Each UID gets a Redis key: "uploads:{uid}"
+// Value: JSON array of timestamps (ms) of successful uploads
+// TTL:   8 days (auto-cleanup, slightly longer than the window)
 
-const UPSTASH_URL   = process.env.UPSTASH_REDIS_REST_URL   || 'https://assuring-ray-176654.upstash.io';
-const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || 'gQAAAAAAArIOAAIgcDEzM2VjMmU2Mjk2NGY0MjEyODY5NjJiOWYwMDgzNWMxNQ';
+const UPSTASH_URL   = process.env.UPSTASH_REDIS_REST_URL   || "https://assuring-ray-176654.upstash.io";
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "gQAAAAAAArIOAAIgcDEzM2VjMmU2Mjk2NGY0MjEyODY5NjJiOWYwMDgzNWMxNQ";
 
-const WEEK_MS      = 7 * 24 * 60 * 60 * 1000;  // 7 days in ms
+const WEEK_MS      = 7 * 24 * 60 * 60 * 1000;   // 7 days in ms
+const TTL_SECONDS  = 8 * 24 * 60 * 60;           // 8 days TTL on the key
 const FREE_LIMIT   = 3;
-const PREMIUM_LIMIT = 10; // unlimited for premium
 
-// Low-level Upstash REST call
+// ── Raw Redis REST call ────────────────────────────────────────────
 async function redis(...args) {
-  const r = await fetch(`${UPSTASH_URL}/${args.map(encodeURIComponent).join('/')}`, {
+  const res = await fetch(`${UPSTASH_URL}/${args.map(encodeURIComponent).join("/")}`, {
     headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
   });
-  const d = await r.json();
-  if (d.error) throw new Error(`Redis error: ${d.error}`);
-  return d.result;
+  const data = await res.json();
+  if (data.error) throw new Error(`Redis error: ${data.error}`);
+  return data.result;
 }
 
-// Key per UID — stores a JSON array of upload timestamps
-function key(uid) { return `uploads:${uid}`; }
-
-// Check how many uploads this UID has done in the last 7 days
+// ── Get upload info for a UID ──────────────────────────────────────
+// Returns: { allowed, used, limit, remaining, resets_at }
 async function getUploadInfo(uid, tier) {
-  const limit = (tier === 'premium') ? PREMIUM_LIMIT : FREE_LIMIT;
-  const now   = Date.now();
+  // Premium users always allowed — no quota
+  if (tier === "premium") {
+    return { allowed: true, used: 0, limit: Infinity, remaining: Infinity, resets_at: null };
+  }
 
-  let timestamps = [];
-  try {
-    const raw = await redis('GET', key(uid));
-    if (raw) timestamps = JSON.parse(raw);
-  } catch (_) {}
+  const key = `uploads:${uid}`;
+  const raw = await redis("GET", key);
 
-  // Only keep timestamps within the last 7 days
-  const recent = timestamps.filter(t => now - t < WEEK_MS);
+  const now        = Date.now();
+  const weekAgo    = now - WEEK_MS;
+  const timestamps = raw ? JSON.parse(raw).filter(t => t > weekAgo) : [];
+  const used       = timestamps.length;
+  const remaining  = Math.max(0, FREE_LIMIT - used);
+  const allowed    = used < FREE_LIMIT;
 
-  // When does the oldest upload expire (i.e. when does a slot free up)?
-  const oldestTs  = recent.length >= limit ? Math.min(...recent) : null;
-  const resetsAt  = oldestTs ? oldestTs + WEEK_MS : null;
-  const remaining = Math.max(0, limit - recent.length);
+  // resets_at = when the oldest upload in the window falls out
+  const resets_at = timestamps.length > 0
+    ? timestamps[0] + WEEK_MS   // oldest timestamp + 7 days
+    : null;
 
-  return {
-    allowed:   recent.length < limit,
-    used:      recent.length,
-    limit,
-    remaining,
-    resets_at: resetsAt,   // ms timestamp when next slot opens
-  };
+  return { allowed, used, limit: FREE_LIMIT, remaining, resets_at };
 }
 
-// Record a successful upload for this UID
+// ── Record a successful upload ─────────────────────────────────────
 async function recordUpload(uid) {
-  const now = Date.now();
-  let timestamps = [];
-  try {
-    const raw = await redis('GET', key(uid));
-    if (raw) timestamps = JSON.parse(raw);
-  } catch (_) {}
+  const key = `uploads:${uid}`;
+  const raw = await redis("GET", key);
 
-  // Only keep last 7 days + add new one
-  const recent = timestamps.filter(t => now - t < WEEK_MS);
-  recent.push(now);
+  const now        = Date.now();
+  const weekAgo    = now - WEEK_MS;
+  const timestamps = raw ? JSON.parse(raw).filter(t => t > weekAgo) : [];
 
-  // Store with 8-day TTL so Redis auto-cleans old keys
-  await redis('SET', key(uid), JSON.stringify(recent), 'EX', String(8 * 24 * 60 * 60));
+  timestamps.push(now);
+
+  // Save back with 8-day TTL so Redis auto-cleans old keys
+  await redis("SET", key, JSON.stringify(timestamps), "EX", String(TTL_SECONDS));
+
+  console.log(`[quota] UID=${uid} used=${timestamps.length}/${FREE_LIMIT} this week`);
 }
 
 module.exports = { getUploadInfo, recordUpload };
