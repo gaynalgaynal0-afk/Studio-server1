@@ -7,7 +7,7 @@ const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || 'gQAAAAAAArIOAAIgc
 
 const WEEK_MS      = 7 * 24 * 60 * 60 * 1000;  // 7 days in ms
 const FREE_LIMIT   = 3;
-const PREMIUM_LIMIT = 999; // unlimited for premium
+const PREMIUM_LIMIT = 10; // unlimited for premium
 
 // Low-level Upstash REST call
 async function redis(...args) {
