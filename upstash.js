@@ -9,9 +9,10 @@
 const UPSTASH_URL   = process.env.UPSTASH_REDIS_REST_URL   || "https://assuring-ray-176654.upstash.io";
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || "gQAAAAAAArIOAAIgcDEzM2VjMmU2Mjk2NGY0MjEyODY5NjJiOWYwMDgzNWMxNQ";
 
-const WEEK_MS      = 7 * 24 * 60 * 60 * 1000;   // 7 days in ms
-const TTL_SECONDS  = 8 * 24 * 60 * 60;           // 8 days TTL on the key
-const FREE_LIMIT   = 3;
+const WEEK_MS       = 7 * 24 * 60 * 60 * 1000;   // 7 days in ms
+const TTL_SECONDS   = 8 * 24 * 60 * 60;           // 8 days TTL on the key
+const FREE_LIMIT    = 3;
+const PREMIUM_LIMIT = 5;
 
 // ── Raw Redis REST call ────────────────────────────────────────────
 async function redis(...args) {
@@ -26,10 +27,8 @@ async function redis(...args) {
 // ── Get upload info for a UID ──────────────────────────────────────
 // Returns: { allowed, used, limit, remaining, resets_at }
 async function getUploadInfo(uid, tier) {
-  // Premium users always allowed — no quota
-  if (tier === "premium") {
-    return { allowed: true, used: 0, limit: Infinity, remaining: Infinity, resets_at: null };
-  }
+  const isPremium = tier === "premium";
+  const LIMIT     = isPremium ? PREMIUM_LIMIT : FREE_LIMIT;
 
   const key = `uploads:${uid}`;
   const raw = await redis("GET", key);
@@ -38,15 +37,15 @@ async function getUploadInfo(uid, tier) {
   const weekAgo    = now - WEEK_MS;
   const timestamps = raw ? JSON.parse(raw).filter(t => t > weekAgo) : [];
   const used       = timestamps.length;
-  const remaining  = Math.max(0, FREE_LIMIT - used);
-  const allowed    = used < FREE_LIMIT;
+  const remaining  = Math.max(0, LIMIT - used);
+  const allowed    = used < LIMIT;
 
   // resets_at = when the oldest upload in the window falls out
   const resets_at = timestamps.length > 0
-    ? timestamps[0] + WEEK_MS   // oldest timestamp + 7 days
+    ? timestamps[0] + WEEK_MS
     : null;
 
-  return { allowed, used, limit: FREE_LIMIT, remaining, resets_at };
+  return { allowed, used, limit: LIMIT, remaining, resets_at, tier: isPremium ? "premium" : "free" };
 }
 
 // ── Record a successful upload ─────────────────────────────────────
@@ -63,7 +62,7 @@ async function recordUpload(uid) {
   // Save back with 8-day TTL so Redis auto-cleans old keys
   await redis("SET", key, JSON.stringify(timestamps), "EX", String(TTL_SECONDS));
 
-  console.log(`[quota] UID=${uid} used=${timestamps.length}/${FREE_LIMIT} this week`);
+  console.log(`[quota] UID=${uid} used=${timestamps.length} this week`);
 }
 
 module.exports = { getUploadInfo, recordUpload };
