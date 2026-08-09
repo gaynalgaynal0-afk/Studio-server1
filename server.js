@@ -2,21 +2,18 @@ const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
 const ffprobeInstaller = require("@ffprobe-installer/ffprobe");
 const path = require("path");
 
-// Inject static ffmpeg & ffprobe into system PATH automatically
-const ffmpegDir = path.dirname(ffmpegInstaller.path);
+const ffmpegDir  = path.dirname(ffmpegInstaller.path);
 const ffprobeDir = path.dirname(ffprobeInstaller.path);
 process.env.PATH = `${ffmpegDir}:${ffprobeDir}:${process.env.PATH}`;
 
-const express = require("express");
-const multer  = require("multer");
-const cors    = require("cors");
-const fs      = require("fs");
+const express      = require("express");
+const multer       = require("multer");
+const cors         = require("cors");
+const fs           = require("fs");
 const { execFile } = require("child_process");
-const crypto  = require("crypto");
-const { S3Client, PutObjectCommand, GetObjectCommand } = require("@aws-sdk/client-s3");
-const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
+const crypto       = require("crypto");
+const { getUploadInfo, recordUpload } = require("./upstash");
 
-// Original premium-check array import (Untouched)
 const PREMIUM_UIDS = require("./premium-check.js");
 
 const FREE_LIMIT_BYTES    = 70  * 1024 * 1024;
@@ -31,78 +28,68 @@ function getTier(uid) {
   };
 }
 
-// ── Patcher routing ────────────────────────────────────────────────────────
-// The extension sends patcher_mode in the POST body:
-//   "bypass"    → Old + FPS Patch method  (bypass_720p / URL-spoof mode)
-//   "timescale" → HQ Upload method        (1080p metadata-only mode)
-// Each maps to a script file sitting next to server.js on the server.
-// You can override either name via environment variables if you rename the files.
+// ── Patcher routing ────────────────────────────────────────────────
 const PATCHER_MAP = {
   bypass:    process.env.PATCHER_BYPASS    || "patcher_bypass.js",
   timescale: process.env.PATCHER_TIMESCALE || "patcher_timescale.js",
 };
-
-// Fallback: if neither env var is set and the old single-patcher env var exists,
-// use it for both modes so existing deployments keep working.
 const LEGACY_PATCHER = process.env.PATCHER_NAME;
 
 function resolvePatcher(mode) {
-  const name = PATCHER_MAP[mode] || PATCHER_MAP["bypass"];
+  const name     = PATCHER_MAP[mode] || PATCHER_MAP["bypass"];
   const resolved = path.join(__dirname, name);
-
-  // If the mapped file doesn't exist but a legacy patcher does, fall back to it
   if (!fs.existsSync(resolved) && LEGACY_PATCHER) {
     const legacy = path.join(__dirname, LEGACY_PATCHER);
     if (fs.existsSync(legacy)) return legacy;
   }
-
   return resolved;
 }
 
-// ── Express setup ──────────────────────────────────────────────────────────
+// ── /tmp janitor ───────────────────────────────────────────────────
+const TMP_DIR        = "/tmp";
+const TMP_MAX_AGE_MS = 30 * 60 * 1000;
+const TMP_SCAN_MS    = 10 * 60 * 1000;
+
+function runTmpJanitor() {
+  try {
+    const now   = Date.now();
+    const files = fs.readdirSync(TMP_DIR);
+    let   wiped = 0;
+    for (const f of files) {
+      if (!/^([0-9a-f]{16,}|patched_[0-9a-f]+\.mp4)$/i.test(f)) continue;
+      const full = path.join(TMP_DIR, f);
+      try {
+        const { mtimeMs } = fs.statSync(full);
+        if (now - mtimeMs > TMP_MAX_AGE_MS) { fs.unlinkSync(full); wiped++; }
+      } catch (_) {}
+    }
+    if (wiped > 0) console.log(`[janitor] Cleaned ${wiped} stale file(s) from /tmp`);
+  } catch (err) {
+    console.warn("[janitor] Scan error:", err.message);
+  }
+}
+
+runTmpJanitor();
+setInterval(runTmpJanitor, TMP_SCAN_MS);
+
+// ── Express setup ──────────────────────────────────────────────────
 const app  = express();
 const PORT = process.env.PORT || 5000;
 
 app.use(cors());
 
 const upload = multer({
-  dest: "/tmp/",
+  dest:   TMP_DIR,
   limits: { fileSize: PREMIUM_LIMIT_BYTES + (5 * 1024 * 1024) },
 });
 
-// ── R2 / S3 client ─────────────────────────────────────────────────────────
-const s3 = new S3Client({
-  region: "auto",
-  endpoint: process.env.R2_ACCOUNT_ID
-    ? `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`
-    : "https://986d0eb1bb514e03f6056730c987cb5e.r2.cloudflarestorage.com",
-  credentials: {
-    accessKeyId:     process.env.R2_ACCESS_KEY_ID     || "af58a7c90330ad646caa39b955ffb229",
-    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY || "246ba1ee7dbab9059ba723dcbd126c766426a2d1e5e47e182b35f51a076b1683",
-  },
-  forcePathStyle: true,
-});
-
-async function uploadToR2AndGetSignedUrl(filePath, destinationKey) {
-  const fileStream = fs.createReadStream(filePath);
-  const bucketName = process.env.R2_BUCKET_NAME || "jv-60fps-studio-server-bucket";
-
-  await s3.send(new PutObjectCommand({
-    Bucket:      bucketName,
-    Key:         destinationKey,
-    Body:        fileStream,
-    ContentType: "video/mp4",
-  }));
-
-  const signedUrl = await getSignedUrl(
-    s3,
-    new GetObjectCommand({ Bucket: bucketName, Key: destinationKey }),
-    { expiresIn: 3600 }
-  );
-  return signedUrl;
+// ── Safe delete ────────────────────────────────────────────────────
+function safeDelete(filePath) {
+  if (!filePath) return;
+  try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch (_) {}
 }
 
-// ── Routes ─────────────────────────────────────────────────────────────────
+// ── Routes ─────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({ status: "ok", service: "JV Lightweight Server" });
 });
@@ -112,58 +99,83 @@ app.get("/tier/:uid", (req, res) => {
   res.json({ tier, limit_mb: limitMB });
 });
 
+// Check upload quota without uploading
+app.get("/quota/:uid", async (req, res) => {
+  const uid           = req.params.uid;
+  const { tier }      = getTier(uid);
+  const info          = await getUploadInfo(uid, tier);
+  res.json({ ...info, tier });
+});
+
 app.post("/patch", upload.single("video"), async (req, res) => {
   const file = req.file || (req.files && req.files.file && req.files.file[0]);
-  if (!file) {
-    return res.status(400).json({ error: "No video file provided" });
-  }
+  if (!file) return res.status(400).json({ error: "No video file provided" });
 
-  const uid  = req.body && req.body.uid;
+  const uid        = req.body && req.body.uid;
   const { tier, limitBytes, limitMB } = getTier(uid);
-  const inputPath = file.path;
+  const inputPath  = file.path;
+  let   outputPath = null;
 
+  let cleaned = false;
+  function cleanup() {
+    if (cleaned) return;
+    cleaned = true;
+    safeDelete(inputPath);
+    if (outputPath) safeDelete(outputPath);
+  }
+  res.on("close", cleanup);
+
+  // ── Check file size ────────────────────────────────────────────
   if (file.size > limitBytes) {
-    if (fs.existsSync(inputPath)) fs.unlink(inputPath, () => {});
+    cleanup();
     return res.status(413).json({
-      error:    `File exceeds the ${limitMB}MB limit for ${tier} users`,
+      error:    `File exceeds the ${limitMB} MB limit for ${tier} users`,
       tier,
       limit_mb: limitMB,
       file_mb:  +(file.size / (1024 * 1024)).toFixed(1),
     });
   }
 
-  // ── Pick the right patcher based on what the extension requested ──
-  // extension sends patcher_mode: "bypass" (Old+FPS) or "timescale" (HQ)
+  // ── Check weekly upload quota ──────────────────────────────────
+  if (uid) {
+    const quota = await getUploadInfo(uid, tier);
+    if (!quota.allowed) {
+      cleanup();
+      return res.status(429).json({
+        error:      `Weekly limit reached (${quota.limit} uploads/week)`,
+        tier,
+        used:       quota.used,
+        limit:      quota.limit,
+        remaining:  0,
+        resets_at:  quota.resets_at,   // ms timestamp
+      });
+    }
+  }
+
+  // ── Resolve patcher ────────────────────────────────────────────
   const patcherMode = (req.body && req.body.patcher_mode) || "bypass";
   const scriptPath  = resolvePatcher(patcherMode);
 
   if (!fs.existsSync(scriptPath)) {
-    if (fs.existsSync(inputPath)) fs.unlink(inputPath, () => {});
+    cleanup();
     return res.status(500).json({
-      error: `Patcher for mode '${patcherMode}' not found on server. ` +
-             `Expected file: ${path.basename(scriptPath)}`,
+      error: `Patcher for mode '${patcherMode}' not found. Expected: ${path.basename(scriptPath)}`,
     });
   }
 
-  const fileId     = crypto.randomBytes(16).toString("hex");
-  const outputPath = path.join("/tmp", `patched_${fileId}.mp4`);
-  const r2ObjectKey = `outputs/jv_${fileId}.mp4`;
+  const fileId = crypto.randomBytes(16).toString("hex");
+  outputPath   = path.join(TMP_DIR, `patched_${fileId}.mp4`);
 
-  const cleanup = () => {
-    [inputPath, outputPath].forEach((p) => {
-      if (fs.existsSync(p)) fs.unlink(p, () => {});
-    });
-  };
-
-  console.log(
-    `Processing UID [${uid || "Guest"}] | mode: ${patcherMode} | patcher: ${path.basename(scriptPath)}`
-  );
+  console.log(`[patch] UID=${uid || "Guest"} | tier=${tier} | mode=${patcherMode}`);
 
   execFile(
     "node",
     [scriptPath, inputPath, outputPath],
-    { timeout: 300000 },
+    { timeout: 300_000 },
     async (error, stdout, stderr) => {
+
+      safeDelete(inputPath);
+
       if (error) {
         cleanup();
         return res.status(422).json({
@@ -173,43 +185,57 @@ app.post("/patch", upload.single("video"), async (req, res) => {
         });
       }
 
-      try {
-        console.log("Uploading output to R2 and generating presigned link...");
-        const signedUrl = await uploadToR2AndGetSignedUrl(outputPath, r2ObjectKey);
-        cleanup();
-
-        return res.json({
-          status:       "success",
-          file_id:      fileId,
-          download_url: signedUrl,
-          tier,
-          limit_mb:     limitMB,
-        });
-      } catch (uploadErr) {
-        cleanup();
-        return res.status(500).json({
-          error:    `R2 Upload failed: ${uploadErr.message}`,
-          tier,
-          limit_mb: limitMB,
-        });
+      // ── Record the upload AFTER successful patch ───────────────
+      if (uid) {
+        try { await recordUpload(uid); } catch (e) {
+          console.warn("[quota] Failed to record upload:", e.message);
+        }
       }
+
+      // ── Stream patched video directly back ─────────────────────
+      res.setHeader("Content-Type",        "video/mp4");
+      res.setHeader("Content-Disposition", `attachment; filename="jv_${fileId}.mp4"`);
+      res.setHeader("X-File-Id",           fileId);
+      res.setHeader("X-Tier",              tier);
+      res.setHeader("X-Limit-MB",          String(limitMB));
+
+      // Send remaining quota in headers so extension can show it
+      if (uid) {
+        try {
+          const q = await getUploadInfo(uid, tier);
+          res.setHeader("X-Uploads-Used",      String(q.used));
+          res.setHeader("X-Uploads-Limit",     String(q.limit));
+          res.setHeader("X-Uploads-Remaining", String(q.remaining));
+          res.setHeader("X-Uploads-Resets-At", String(q.resets_at || ''));
+        } catch (_) {}
+      }
+
+      const stream = fs.createReadStream(outputPath);
+      stream.on("error", (e) => {
+        console.error("[patch] Stream error:", e.message);
+        cleanup();
+        if (!res.headersSent) res.status(500).json({ error: "Failed to stream output file" });
+      });
+      stream.on("end", () => {
+        cleanup();
+        console.log(`[patch] Done — jv_${fileId}.mp4`);
+      });
+      stream.pipe(res);
     }
   );
 });
 
-// ── Error handler ──────────────────────────────────────────────────────────
+// ── Error handler ──────────────────────────────────────────────────
 app.use((err, req, res, next) => {
   if (err && err.code === "LIMIT_FILE_SIZE") {
-    return res.status(413).json({
-      error: `File exceeds the maximum allowed size (${(PREMIUM_LIMIT_BYTES / (1024 * 1024)).toFixed(0)}MB)`,
-    });
+    return res.status(413).json({ error: `File too large (max ${(PREMIUM_LIMIT_BYTES / 1024 / 1024).toFixed(0)} MB)` });
   }
-  if (err) {
-    return res.status(500).json({ error: err.message || "Unexpected server error" });
-  }
+  if (err) return res.status(500).json({ error: err.message || "Unexpected error" });
   next();
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`[server] Listening on port ${PORT}`);
 });
+EOF
+echo "Done"
